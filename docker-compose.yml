@@ -1,0 +1,35 @@
+services:
+  audit:
+    build: .
+    environment:
+      PORT: "8080"
+      AUDIT_DB: /data/audits.db
+    volumes:
+      - audit-data:/data
+    ports:
+      # Configurable host port for the API and its health check:
+      #   HOST_PORT=9090 docker compose up audit
+      - "${HOST_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  # One-shot acceptance service: runs build checks, code tests and API/HTTP
+  # smoke against `audit`, then exits; its exit code is the acceptance result.
+  #   docker compose up --build --abort-on-container-exit --exit-code-from verify verify
+  verify:
+    build: .
+    command: ["sh", "verify/run.sh"]
+    environment:
+      BASE_URL: http://audit:8080
+    depends_on:
+      audit:
+        condition: service_healthy
+    restart: "no"
+
+volumes:
+  audit-data:
