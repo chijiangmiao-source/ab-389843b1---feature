@@ -233,15 +233,19 @@ class _Propagator:
                 if cur is not None and cur in pos and cur != EPOCH:
                     cycle_nodes = seq[pos[cur]:]
                     edge_idx = []
+                    steps = []
                     for nd in cycle_nodes:
                         rec = src[self.idx[nd]]
                         if rec is not None:
                             edge_idx.append(rec[1])
+                            steps.append([rec[1], rec[2]])
                     return {
                         "kind": "positive_cycle",
+                        "chain": which,
                         "node": cur,
                         "cycle_nodes": cycle_nodes,
                         "cycle_edge_indices": edge_idx,
+                        "cycle_steps": steps,
                     }
         return {"kind": "positive_cycle", "node": None,
                 "cycle_nodes": [], "cycle_edge_indices": []}
@@ -282,8 +286,10 @@ def _build_edges(modulus, anchor_tick, events, constraints):
             edges.append((EPOCH, d, lo_k, hi_k, ("constraint", c.id)))
             records.append({
                 "kind": "anchor_unary",
+                "unary_kind": "anchor_to_event",
                 "constraint_id": c.id,
                 "event": d,
+                "residue": A - cd,
                 "k_lo": lo_k,
                 "k_hi": hi_k,
                 "text": (f"{c.id}: {c.lo} <= t({d}) - {A} <= {c.hi}  =>  "
@@ -297,8 +303,10 @@ def _build_edges(modulus, anchor_tick, events, constraints):
             edges.append((EPOCH, s, -hi_k, -lo_k, ("constraint", c.id)))
             records.append({
                 "kind": "anchor_unary",
+                "unary_kind": "event_to_anchor",
                 "constraint_id": c.id,
                 "event": s,
+                "residue": cs - A,
                 "k_lo": -hi_k,
                 "k_hi": -lo_k,
                 "text": (f"{c.id}: {c.lo} <= {A} - t({s}) <= {c.hi}  =>  "
@@ -316,6 +324,7 @@ def _build_edges(modulus, anchor_tick, events, constraints):
                 "constraint_id": c.id,
                 "src": s,
                 "dst": d,
+                "residue": cs - cd,
                 "delta_lo": k_lo,
                 "delta_hi": k_hi,
                 "text": (f"{c.id}: {c.lo} <= t({d}) - t({s}) <= {c.hi}  =>  "

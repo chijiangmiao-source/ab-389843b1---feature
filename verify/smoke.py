@@ -9,6 +9,12 @@ Exercises the live API end to end:
   * idempotent records: replay returns the original audit number, a changed
     payload is rejected (409) and creates no new record
   * frozen record retrieval by audit number
+  * minimal window-relaxation repairs on frozen unsat audits:
+      - single-window repair (one tick),
+      - canonical adjudication of equal-cost candidates,
+      - illegal source rejection (non-unsat / unknown audit),
+      - idempotent replay by repair_id, frozen repair retrieval,
+      - compatible reads of the original (unchanged) audit.
 
 Exit code 0 iff every check passes.
 """
@@ -144,6 +150,7 @@ def main():
     code, body = request("POST", "/audits", unsat)
     check("unsat.created", code == 201, f"got {code}: {body}")
     check("unsat.status", body.get("status") == "unsat")
+    audit_unsat = body.get("audit_no")
     conflict = body.get("result", {}).get("conflict", {})
     check("unsat.chain", sorted(conflict.get("constraint_chain", []))
           == ["ab", "ba"], f"got {conflict.get('constraint_chain')}")
@@ -174,6 +181,88 @@ def main():
                           {"id": "Z", "counter": 1}])
     code, _ = request("POST", "/audits", bad)
     check("validation.disconnected_400", code == 400, f"got {code}")
+
+    # -- minimal window-relaxation repairs ------------------------------------
+    # 1. single-window repair: a modular residue conflict fixed by one tick.
+    rid_res = f"smoke-repair-residue-{run}"
+    residue = payload(
+        f"smoke-unsat-residue-{run}",
+        events=[{"id": "B", "counter": 4}],
+        constraints=[
+            {"id": "ab", "src": "anchor", "dst": "B", "window": [8, 8]}])
+    code, body = request("POST", "/audits", residue)
+    check("repair.source_unsat", code == 201
+          and body.get("status") == "unsat", f"got {code}: {body}")
+    audit_res = body.get("audit_no")
+    code, body = request("POST", f"/audits/{audit_res}/repairs",
+                         {"repair_id": rid_res})
+    check("repair.single_created", code == 201, f"got {code}: {body}")
+    result = body.get("result", {})
+    check("repair.single_cost", result.get("total_extension") == 1,
+          f"got {result.get('total_extension')}")
+    check("repair.single_timeline",
+          ticks(result.get("timeline", {})).get("B") == 104,
+          f"got {result.get('timeline')}")
+    rc = {c["id"]: c for c in result.get("constraints", [])}
+    check("repair.single_window",
+          rc.get("ab", {}).get("relaxed_window") == [7, 9]
+          and rc["ab"].get("direction") == "upper"
+          and rc["ab"].get("recomputed_difference") == 9,
+          f"got {rc.get('ab')}")
+    check("repair.frozen_source_ref",
+          result.get("source", {}).get("audit_no") == audit_res
+          and result["source"].get("original_status") == "unsat")
+    repair_res_no = body.get("repair_no")
+
+    # 2. canonical adjudication of equal-cost candidates.
+    rid_tie = f"smoke-repair-tie-{run}"
+    code, body = request("POST", f"/audits/{audit_unsat}/repairs",
+                         {"repair_id": rid_tie})
+    check("repair.tie_created", code == 201, f"got {code}: {body}")
+    result = body.get("result", {})
+    decision = result.get("canonical_decision", {})
+    check("repair.tie_cost", result.get("total_extension") == 100)
+    check("repair.tie_relax_vector",
+          decision.get("constraint_order") == ["ab", "ba"]
+          and decision.get("relax_vector") == [0, 100],
+          f"got {decision}")
+    check("repair.tie_timeline",
+          ticks(result.get("timeline", {})).get("B") == 103
+          and decision.get("wrap_vector") == [1],
+          f"got {result.get('timeline')}")
+    repair_tie_no = body.get("repair_no")
+
+    # 3. illegal source rejection.
+    code, _ = request("POST", f"/audits/{audit_unique}/repairs",
+                      {"repair_id": f"smoke-repair-badstatus-{run}"})
+    check("repair.non_unsat_409", code == 409, f"got {code}")
+    code, _ = request("POST", "/audits/99999999/repairs",
+                      {"repair_id": f"smoke-repair-noaudit-{run}"})
+    check("repair.unknown_audit_404", code == 404, f"got {code}")
+    code, _ = request("POST", f"/audits/{audit_unsat}/repairs", {})
+    check("repair.missing_id_400", code == 400, f"got {code}")
+    code, _ = request("POST", f"/audits/{audit_unsat}/repairs",
+                      {"repair_id": rid_tie, "unexpected": 1})
+    check("repair.changed_payload_400", code == 400, f"got {code}")
+
+    # 4. idempotent replay + frozen retrieval + compatible source read.
+    code, body = request("POST", f"/audits/{audit_unsat}/repairs",
+                         {"repair_id": rid_tie})
+    check("repair.replay_200", code == 200
+          and body.get("repair_no") == repair_tie_no
+          and body.get("replayed") is True, f"got {code}: {body}")
+    code, rec = request("GET", f"/repairs/{repair_res_no}")
+    check("repair.get_frozen", code == 200
+          and rec.get("repair_id") == rid_res
+          and rec.get("result", {}).get("total_extension") == 1
+          and rec.get("source", {}).get("result", {}).get("status")
+          == "unsat", f"got {code}: {rec}")
+    code, _ = request("GET", "/repairs/99999999")
+    check("repair.get_missing_404", code == 404, f"got {code}")
+    code, src = request("GET", f"/audits/{audit_unsat}")
+    check("repair.source_still_unsat",
+          code == 200 and src.get("result", {}).get("status") == "unsat"
+          and "repair" not in src, f"got {code}")
 
     print(f"\n{checks - len(failures)}/{checks} smoke checks passed")
     if failures:
