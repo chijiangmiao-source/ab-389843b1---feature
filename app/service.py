@@ -2,12 +2,20 @@
 
 Endpoints
 ---------
-GET  /health           -> 200 {"status": "ok"}
-POST /audits           -> create an audit (idempotent on request_id)
-                          201 new record, 200 replayed record,
-                          400 invalid payload, 409 request_id reuse with a
-                          different payload
-GET  /audits/{number}  -> frozen record: input, conclusion and evidence
+GET  /health                     -> 200 {"status": "ok"}
+POST /audits                     -> create an audit (idempotent on request_id)
+                                    201 new record, 200 replayed record,
+                                    400 invalid payload, 409 request_id reuse
+                                    with a different payload
+GET  /audits/{number}            -> frozen record: input, conclusion & evidence
+POST /audits/{number}/repairs    -> open a minimum window-relaxation repair
+                                    against a frozen unsat audit (fix marker
+                                    in the body); 201 new / 200 replayed,
+                                    404 unknown source audit, 409 source is
+                                    not unsat or fix_id reuse with a different
+                                    payload
+GET  /repairs/{number}           -> frozen repair: source reference, minimum
+                                    cost, canonical timeline and evidence
 
 Configuration via environment:
   PORT      listen port (default 8080)
@@ -21,8 +29,9 @@ import os
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from .repair import RepairError, repair
 from .solver import ValidationError, solve
-from .store import AuditStore, PayloadConflict
+from .store import AuditStore, PayloadConflict, RepairConflict
 
 MAX_BODY = 1 << 20  # 1 MiB
 
@@ -66,28 +75,48 @@ class AuditHandler(BaseHTTPRequestHandler):
             else:
                 self._send(200, rec)
             return
+        m = re.fullmatch(r"/repairs/(\d+)", path)
+        if m:
+            rec = self.store.get_repair(int(m.group(1)))
+            if rec is None:
+                self._error(404, f"repair {m.group(1)} not found")
+            else:
+                self._send(200, rec)
+            return
         self._error(404, "not found")
 
-    def do_POST(self):
-        path = self.path.split("?", 1)[0]
-        if path != "/audits":
-            self._error(404, "not found")
-            return
+    def _read_payload(self):
+        """Parse one JSON request body; returns (payload, error_response).
+
+        ``error_response`` is None on success; otherwise it is the
+        (code, message) to send back.
+        """
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
-            self._error(400, "invalid Content-Length")
-            return
+            return None, (400, "invalid Content-Length")
         if length <= 0 or length > MAX_BODY:
-            self._error(400, "missing or oversized request body")
-            return
+            return None, (400, "missing or oversized request body")
         try:
             payload = json.loads(self.rfile.read(length))
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            self._error(400, f"request body is not valid JSON: {exc}")
-            return
+            return None, (400, f"request body is not valid JSON: {exc}")
         if not isinstance(payload, dict):
-            self._error(400, "payload must be a JSON object")
+            return None, (400, "payload must be a JSON object")
+        return payload, None
+
+    def do_POST(self):
+        path = self.path.split("?", 1)[0]
+        m = re.fullmatch(r"/audits/(\d+)/repairs", path)
+        if m:
+            self._post_repair(int(m.group(1)))
+            return
+        if path != "/audits":
+            self._error(404, "not found")
+            return
+        payload, err = self._read_payload()
+        if err is not None:
+            self._error(*err)
             return
 
         request_id = payload.get("request_id")
@@ -115,6 +144,74 @@ class AuditHandler(BaseHTTPRequestHandler):
             "result": record["result"],
             "replayed": not created,
         })
+
+    def _post_repair(self, audit_no):
+        payload, err = self._read_payload()
+        if err is not None:
+            self._error(*err)
+            return
+        source = self.store.get(audit_no)
+        if source is None:
+            self._error(404, f"audit {audit_no} not found; "
+                             "cannot reference an unknown unsat record")
+            return
+
+        fix_id = payload.get("fix_id")
+        if not isinstance(fix_id, str) or not fix_id:
+            self._error(400, "fix_id must be a non-empty string")
+            return
+
+        # A fix marker may only carry a payload identical to the frozen source
+        # (at most a benign echo); the source audit and its reading are never
+        # rewritten.  The actual repair input is always the frozen input.
+        echo = payload.get("payload")
+        if echo is not None and echo != source["input"]:
+            self._error(409, "repair payload must match the frozen source "
+                             "audit input; source records cannot be rewritten")
+            return
+
+        request = {"source_audit_no": audit_no, "payload": source["input"]}
+
+        # Idempotent replays are served without recomputation; an existing
+        # fix_id with a different request is rejected and creates nothing.
+        existing = self.store.find_repair(fix_id)
+        if existing is not None:
+            if existing["request"] != request:
+                self._error(409, f"fix_id {fix_id!r} already used with a "
+                                 f"different request (existing repair_no="
+                                 f"{existing['repair_no']}); refusing to "
+                                 f"create a new repair result")
+                return
+            self._send(200, self._repair_response(existing, replayed=True))
+            return
+
+        try:
+            result = repair(source["input"], source["result"])
+        except RepairError as exc:
+            self._error(409, str(exc))
+            return
+
+        try:
+            record, created = self.store.create_repair(
+                fix_id, audit_no, request, result)
+        except RepairConflict as exc:
+            self._error(409, str(exc))
+            return
+
+        self._send(201 if created else 200,
+                   self._repair_response(record, replayed=not created))
+
+    @staticmethod
+    def _repair_response(record, replayed):
+        return {
+            "repair_no": record["repair_no"],
+            "fix_id": record["fix_id"],
+            "source_audit_no": record["source_audit_no"],
+            "status": record["result"]["status"],
+            "total_expansion": record["result"]["total_expansion"],
+            "result": record["result"],
+            "replayed": replayed,
+        }
 
 
 def make_server(store: AuditStore, port: int) -> ThreadingHTTPServer:

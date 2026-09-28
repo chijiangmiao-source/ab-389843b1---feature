@@ -9,6 +9,12 @@ Exercises the live API end to end:
   * idempotent records: replay returns the original audit number, a changed
     payload is rejected (409) and creates no new record
   * frozen record retrieval by audit number
+  * minimum window-relaxation repairs opened against frozen unsat audits:
+      - single-window minimum repair
+      - canonical adjudication among equal-cost candidates
+      - illegal source rejection (unknown audit / satisfiable audit)
+      - original audits remain compatible and unmodified
+      - fix marker idempotency and frozen repair retrieval
 
 Exit code 0 iff every check passes.
 """
@@ -174,6 +180,129 @@ def main():
                           {"id": "Z", "counter": 1}])
     code, _ = request("POST", "/audits", bad)
     check("validation.disconnected_400", code == 400, f"got {code}")
+
+    # -- repairs: minimum window relaxation -----------------------------------
+    # (a) single-window repair: modular residue conflict needs exactly 1 tick
+    rid_f1 = f"smoke-fix-src-{run}"
+    single = {
+        "request_id": rid_f1,
+        "modulus": 100,
+        "anchor": {"id": "A", "tick": 95},
+        "events": [{"id": "B", "counter": 4}],
+        "constraints": [
+            {"id": "ab", "src": "anchor", "dst": "B", "window": [8, 8]},
+        ],
+    }
+    code, body = request("POST", "/audits", single)
+    check("repair.source_unsat_created", code == 201, f"got {code}: {body}")
+    check("repair.source_is_unsat", body.get("status") == "unsat")
+    single_no = body.get("audit_no")
+    code, fix = request("POST", f"/audits/{single_no}/repairs",
+                        {"fix_id": f"fix-single-{run}"})
+    check("repair.single_created", code == 201, f"got {code}: {fix}")
+    check("repair.single_status", fix.get("status") == "repaired")
+    check("repair.single_total_is_1",
+          fix.get("total_expansion") == 1, f"got {fix.get('total_expansion')}")
+    single_repair_no = fix.get("repair_no")
+    win = {w["constraint_id"]: w
+           for w in fix.get("result", {}).get("windows", [])}.get("ab", {})
+    check("repair.single_window",
+          win.get("original_window") == [8, 8]
+          and win.get("relaxed_window") == [8, 9]
+          and win.get("direction") == "upper"
+          and win.get("recomputed_difference") == 9,
+          f"got {win}")
+    check("repair.single_timeline",
+          ticks(fix["result"]["canonical_timeline"]).get("B") == 104,
+          f"got {fix.get('result', {}).get('canonical_timeline')}")
+    check("repair.single_duality",
+          fix["result"]["optimality_evidence"]["strong_duality"] is True)
+
+    # same fix_id + same payload replays the original repair number
+    code, fix2 = request("POST", f"/audits/{single_no}/repairs",
+                         {"fix_id": f"fix-single-{run}"})
+    check("repair.replay_status", code == 200, f"got {code}")
+    check("repair.replay_same_no",
+          fix2.get("repair_no") == single_repair_no,
+          f"{fix2.get('repair_no')} != {single_repair_no}")
+    check("repair.replay_flag", fix2.get("replayed") is True)
+
+    # frozen repair read by number
+    code, rec = request("GET", f"/repairs/{single_repair_no}")
+    check("repair.get_frozen_200", code == 200, f"got {code}")
+    check("repair.get_frozen_content",
+          rec.get("fix_id") == f"fix-single-{run}"
+          and rec.get("source_audit_no") == single_no
+          and rec.get("result", {}).get("total_expansion") == 1
+          and rec.get("request", {}).get("payload", {})
+          .get("constraints") == single["constraints"],
+          f"got {rec}")
+    code, _ = request("GET", "/repairs/99999999")
+    check("repair.get_missing_404", code == 404, f"got {code}")
+
+    # (b) multiple equal-cost candidates adjudicated canonically
+    rid_f2 = f"smoke-fix-eq-{run}"
+    equal = {
+        "request_id": rid_f2,
+        "modulus": 100,
+        "anchor": {"id": "A", "tick": 95},
+        "events": [{"id": "B", "counter": 3}],
+        "constraints": [
+            {"id": "ab", "src": "anchor", "dst": "B", "window": [8, 8]},
+            {"id": "ba", "src": "B", "dst": "anchor", "window": [92, 92]},
+        ],
+    }
+    code, body = request("POST", "/audits", equal)
+    eq_no = body.get("audit_no")
+    code, fix = request("POST", f"/audits/{eq_no}/repairs",
+                        {"fix_id": f"fix-equal-{run}"})
+    check("repair.equal_created", code == 201, f"got {code}: {fix}")
+    check("repair.equal_total_100",
+          fix.get("total_expansion") == 100,
+          f"got {fix.get('total_expansion')}")
+    wins = {w["constraint_id"]: w
+            for w in fix.get("result", {}).get("windows", [])}
+    check("repair.equal_vector_adjucated",
+          fix.get("result", {}).get("relaxation_vector")
+          == [{"constraint_id": "ab", "extension": [0, 0]},
+              {"constraint_id": "ba", "extension": [100, 0]}]
+          and wins.get("ab", {}).get("relaxed_window") == [8, 8]
+          and wins.get("ba", {}).get("relaxed_window") == [-8, 92],
+          f"got {fix.get('result', {}).get('relaxation_vector')}")
+    check("repair.equal_timeline",
+          ticks(fix["result"]["canonical_timeline"]).get("B") == 103
+          and fix["result"]["wrap_counts"].get("B") == 1,
+          f"got {fix.get('result', {}).get('canonical_timeline')}")
+    check("repair.equal_diffs",
+          wins.get("ab", {}).get("recomputed_difference") == 8
+          and wins.get("ba", {}).get("recomputed_difference") == -8,
+          f"got {wins}")
+
+    # (c) illegal sources
+    code, _ = request("POST", "/audits/99999999/repairs",
+                      {"fix_id": f"fix-badsrc-{run}"})
+    check("repair.unknown_source_404", code == 404, f"got {code}")
+    code, body = request("POST", f"/audits/{audit_unique}/repairs",
+                         {"fix_id": f"fix-satsrc-{run}"})
+    check("repair.satisfiable_source_409", code == 409, f"got {code}: {body}")
+    code, _ = request("POST", f"/audits/{single_no}/repairs", {})
+    check("repair.missing_fix_id_400", code == 400, f"got {code}")
+    # fix id reuse with a changed payload creates nothing
+    tampered = json.loads(json.dumps(single))
+    tampered["modulus"] = 99
+    code, body = request("POST", f"/audits/{single_no}/repairs",
+                         {"fix_id": f"fix-tamper-{run}", "payload": tampered})
+    check("repair.changed_payload_409", code == 409, f"got {code}: {body}")
+
+    # (d) original audits stay compatible and unmodified
+    code, src = request("GET", f"/audits/{single_no}")
+    check("repair.source_read_compatible",
+          code == 200 and src.get("result", {}).get("status") == "unsat"
+          and src.get("input", {}).get("modulus") == 100
+          and src.get("input", {}).get("events") == single["events"]
+          and src.get("input", {}).get("constraints")
+          == single["constraints"],
+          f"got {code} {src}")
 
     print(f"\n{checks - len(failures)}/{checks} smoke checks passed")
     if failures:
